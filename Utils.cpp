@@ -336,6 +336,8 @@ int PrepareAppDirFromRoot(const std::string& path, const std::string& root, int 
         appDir = kAppMediaDir;
         if (!sdcardfsSupport) {
             gid = AID_MEDIA_RW;
+            // See comments for kAppDataDir above
+            additionalGids.push_back(uid);
         }
     } else if (StartsWith(pathFromRoot, kAppObbDir)) {
         appDir = kAppObbDir;
@@ -349,9 +351,9 @@ int PrepareAppDirFromRoot(const std::string& path, const std::string& root, int 
         return -EINVAL;
     }
 
-    // mode = 777, plus sticky bit on directory to inherit GID when apps
+    // mode = 770, plus setgid bit on directory to inherit GID when apps
     // create subdirs
-    mode_t mode = S_IRWXU | S_IRWXG | S_IRWXO | S_ISGID;
+    mode_t mode = S_IRWXU | S_IRWXG | S_ISGID;
     // the project ID for application-specific directories is directly
     // derived from their uid
 
