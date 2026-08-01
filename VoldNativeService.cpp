@@ -26,7 +26,10 @@
 #include <utils/Trace.h>
 
 #include <stdio.h>
+#include <chrono>
+#include <cerrno>
 #include <fstream>
+#include <mutex>
 #include <thread>
 
 #include "Benchmark.h"
@@ -114,6 +117,17 @@ static binder::Status translateBool(bool status) {
     std::lock_guard<std::mutex> lock(VolumeManager::Instance()->getCryptLock()); \
     ATRACE_CALL();
 
+constexpr std::chrono::milliseconds kProbeTimeout(10000);
+
+bool tryLockForProbe(std::mutex& m) {
+    const auto deadline = std::chrono::steady_clock::now() + kProbeTimeout;
+    while (!m.try_lock()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return true;
+}
+
 }  // namespace
 
 status_t VoldNativeService::start() {
@@ -153,9 +167,22 @@ binder::Status VoldNativeService::setListener(
 binder::Status VoldNativeService::monitor() {
     ENFORCE_SYSTEM_OR_ROOT;
 
-    // Simply acquire/release each lock for watchdog
-    { ACQUIRE_LOCK; }
-    { ACQUIRE_CRYPT_LOCK; }
+    // Acquire/release each lock for watchdog, but bound the wait: a wedged
+    // lock holder must not stall this probe past the system_server watchdog
+    // limit.  Report an error instead - StorageManagerService logs it and
+    // completes the health check.
+    auto& vm = *VolumeManager::Instance();
+    if (!tryLockForProbe(vm.getLock())) {
+        LOG(ERROR) << "Watchdog probe: vold lock busy for " << kProbeTimeout.count() << "ms";
+        return binder::Status::fromServiceSpecificError(EBUSY, "vold lock wedged");
+    }
+    vm.getLock().unlock();
+    if (!tryLockForProbe(vm.getCryptLock())) {
+        LOG(ERROR) << "Watchdog probe: vold crypt lock busy for " << kProbeTimeout.count()
+                   << "ms";
+        return binder::Status::fromServiceSpecificError(EBUSY, "vold crypt lock wedged");
+    }
+    vm.getCryptLock().unlock();
 
     return Ok();
 }
