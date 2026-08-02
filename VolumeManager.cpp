@@ -1138,19 +1138,31 @@ int VolumeManager::setupAppDir(const std::string& path, int32_t appUid, bool fix
 
         return false;
     };
-    auto volume = findVolumeWithFilter(filter_fn);
-    if (volume == nullptr) {
-        LOG(ERROR) << "Failed to find mounted volume for " << path;
-        return -EINVAL;
+    std::string internalPath;
+    std::string volumePath;
+    std::string volumeRoot;
+    VolumeBase::Type volumeType;
+    {
+        // Only the volume lookup may run under mLock: the app dir walk below
+        // (restorecon/chown of whole trees) would otherwise stall every other
+        // vold call, including the watchdog monitor() probe.
+        std::lock_guard<std::mutex> lock(mLock);
+        auto volume = findVolumeWithFilter(filter_fn);
+        if (volume == nullptr) {
+            LOG(ERROR) << "Failed to find mounted volume for " << path;
+            return -EINVAL;
+        }
+        internalPath = volume->getInternalPath();
+        volumePath = volume->getPath();
+        volumeRoot = volume->getRootPath();
+        volumeType = volume->getType();
     }
+
     // Convert paths to lower filesystem paths to avoid making FUSE requests for these reasons:
     // 1. A FUSE request from vold puts vold at risk of hanging if the FUSE daemon is down
     // 2. The FUSE daemon prevents requests on /mnt/user/0/emulated/<userid != 0> and a request
     // on /storage/emulated/10 means /mnt/user/0/emulated/10
-    const std::string lowerPath =
-            volume->getInternalPath() + path.substr(volume->getPath().length());
-
-    const std::string volumeRoot = volume->getRootPath();  // eg /data/media/0
+    const std::string lowerPath = internalPath + path.substr(volumePath.length());
 
     const int access_result = access(lowerPath.c_str(), F_OK);
     if (fixupExistingOnly && access_result != 0) {
@@ -1164,7 +1176,7 @@ int VolumeManager::setupAppDir(const std::string& path, int32_t appUid, bool fix
         return OK;
     }
 
-    if (volume->getType() == VolumeBase::Type::kPublic) {
+    if (volumeType == VolumeBase::Type::kPublic) {
         // On public volumes, we don't need to setup permissions, as everything goes through
         // FUSE; just create the dirs and be done with it.
         return fs_mkdirs(lowerPath.c_str(), 0700);
