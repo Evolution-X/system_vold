@@ -15,7 +15,6 @@
  */
 
 #include "IdleMaint.h"
-#include "FileDeviceUtils.h"
 #include "NvmeDeviceUtils.h"
 #include "Utils.h"
 #include "VoldUtil.h"
@@ -36,11 +35,13 @@
 #include <wakelock/wakelock.h>
 
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 using android::base::Basename;
 using android::base::ReadFileToString;
@@ -56,6 +57,7 @@ namespace vold {
 enum class PathTypes {
     kMountPoint = 1,
     kBlkDevice,
+    kF2fsBlkDevice,
 };
 
 enum class IdleMaintStats {
@@ -86,8 +88,8 @@ static IdleMaintStats idle_maint_stat(IdleMaintStats::kStopped);
 static std::condition_variable cv_abort, cv_stop;
 static std::mutex cv_m;
 
-static bool isSupportedFsType(const std::string& fs_type) {
-    return fs_type == "ext4" || fs_type == "f2fs";
+static bool isSupportedFsType(const std::string& fs_type, PathTypes path_type) {
+    return fs_type == "f2fs" || (path_type == PathTypes::kBlkDevice && fs_type == "ext4");
 }
 
 static void addFromVolumeManager(std::list<std::string>* paths, PathTypes path_type) {
@@ -99,11 +101,12 @@ static void addFromVolumeManager(std::list<std::string>* paths, PathTypes path_t
         if (vol != nullptr && vol->getState() == VolumeBase::State::kMounted) {
             if (path_type == PathTypes::kMountPoint) {
                 paths->push_back(vol->getPath());
-            } else if (path_type == PathTypes::kBlkDevice) {
+            } else {
                 std::string blk_path;
                 const std::string& fs_type = vol->getFsType();
-                if (isSupportedFsType(fs_type) && (Realpath(vol->getRawDmDevPath(), &blk_path) ||
-                                                   Realpath(vol->getRawDevPath(), &blk_path))) {
+                if (isSupportedFsType(fs_type, path_type) &&
+                    (Realpath(vol->getRawDmDevPath(), &blk_path) ||
+                     Realpath(vol->getRawDevPath(), &blk_path))) {
                     paths->push_back(std::string("/sys/fs/") + fs_type + "/" + Basename(blk_path));
                 }
             }
@@ -112,6 +115,12 @@ static void addFromVolumeManager(std::list<std::string>* paths, PathTypes path_t
 }
 
 static void addFromFstab(std::list<std::string>* paths, PathTypes path_type, bool only_data_part) {
+    android::fs_mgr::Fstab mounted_fstab;
+    if (path_type != PathTypes::kMountPoint &&
+        !android::fs_mgr::ReadFstabFromProcMounts(&mounted_fstab)) {
+        return;
+    }
+
     std::string previous_mount_point;
     for (const auto& entry : fstab_default) {
         // Skip raw partitions and swap space.
@@ -145,11 +154,15 @@ static void addFromFstab(std::list<std::string>* paths, PathTypes path_type, boo
 
         if (path_type == PathTypes::kMountPoint) {
             paths->push_back(entry.mount_point);
-        } else if (path_type == PathTypes::kBlkDevice) {
+        } else {
             std::string path;
-            if (isSupportedFsType(entry.fs_type) &&
-                Realpath(android::vold::BlockDeviceForPath(entry.mount_point + "/"), &path)) {
-                paths->push_back("/sys/fs/" + entry.fs_type + "/" + Basename(path));
+            // The mounted filesystem selects the active fstab alternative.
+            const auto* mounted_entry =
+                    android::fs_mgr::GetEntryForMountPoint(&mounted_fstab, entry.mount_point);
+            if (mounted_entry != nullptr &&
+                isSupportedFsType(mounted_entry->fs_type, path_type) &&
+                Realpath(mounted_entry->blk_device, &path)) {
+                paths->push_back("/sys/fs/" + mounted_entry->fs_type + "/" + Basename(path));
             }
         }
 
@@ -285,6 +298,10 @@ static void runDevGcFstab(void) {
     }
 
     path = path + "/manual_gc";
+    // UFS health descriptors do not imply support for manual device GC.
+    if (access(path.c_str(), F_OK) != 0 && errno == ENOENT) {
+        return;
+    }
     Timer timer;
 
     LOG(DEBUG) << "Start Dev GC on " << path;
@@ -347,8 +364,8 @@ int RunIdleMaint(bool needGC, const android::sp<android::os::IVoldTaskListener>&
 
     if (needGC) {
         std::list<std::string> paths;
-        addFromFstab(&paths, PathTypes::kBlkDevice, false);
-        addFromVolumeManager(&paths, PathTypes::kBlkDevice);
+        addFromFstab(&paths, PathTypes::kF2fsBlkDevice, false);
+        addFromVolumeManager(&paths, PathTypes::kF2fsBlkDevice);
 
         startGc(paths);
 
@@ -427,11 +444,13 @@ int32_t GetStorageLifeTimeDirect() {
     return -1;
 }
 
-int getLifeTime(const std::string& path) {
+int getLifeTime(const std::string& path, bool optional = false) {
     std::string result;
 
     if (!ReadFileToString(path, &result)) {
-        PLOG(WARNING) << "Reading lifetime estimation failed for " << path;
+        if (!optional || errno != ENOENT) {
+            PLOG(WARNING) << "Reading lifetime estimation failed for " << path;
+        }
         return -1;
     }
     return std::stoi(result, 0, 16);
@@ -446,7 +465,7 @@ int32_t GetStorageLifeTime() {
         }
         std::string lifeTimeBasePath = path + "/health_descriptor/life_time_estimation_";
 
-        lifeTime = getLifeTime(lifeTimeBasePath + "c");
+        lifeTime = getLifeTime(lifeTimeBasePath + "c", true /* optional */);
         if (lifeTime == -1) {
             int32_t lifeTimeA = getLifeTime(lifeTimeBasePath + "a");
             int32_t lifeTimeB = getLifeTime(lifeTimeBasePath + "b");
@@ -470,7 +489,7 @@ int32_t GetStorageRemainingLifetime() {
         }
         std::string lifeTimeBasePath = path + "/health_descriptor/life_time_estimation_";
 
-        lifeTime = getLifeTime(lifeTimeBasePath + "c");
+        lifeTime = getLifeTime(lifeTimeBasePath + "c", true /* optional */);
         if (lifeTime == -1) {
             int32_t lifeTimeA = getLifeTime(lifeTimeBasePath + "a");
             int32_t lifeTimeB = getLifeTime(lifeTimeBasePath + "b");
@@ -494,7 +513,7 @@ void SetGCUrgentPace(int32_t neededSegments, int32_t minSegmentThreshold, float 
     bool needGC = false;
     int32_t sleepTime;
 
-    addFromFstab(&paths, PathTypes::kBlkDevice, true);
+    addFromFstab(&paths, PathTypes::kF2fsBlkDevice, true);
     if (paths.empty()) {
         LOG(WARNING) << "There is no valid blk device path for data partition";
         return;
@@ -598,7 +617,7 @@ void SetGCUrgentPace(int32_t neededSegments, int32_t minSegmentThreshold, float 
 void SetMaxLockElapsedTime(int maxTime) {
     std::list<std::string> paths;
 
-    addFromFstab(&paths, PathTypes::kBlkDevice, true);
+    addFromFstab(&paths, PathTypes::kF2fsBlkDevice, true);
     if (paths.empty()) {
         LOG(WARNING) << "There is no valid blk device path for data partition";
         return;
